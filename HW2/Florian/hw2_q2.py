@@ -1,268 +1,327 @@
 import os
 import csv
-import math
 import time
 import copy
-import random
 
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader
 
-import matplotlib.pyplot as plt
-
 from utils import (
+    configure_seed,
     load_rnacompete_data,
     masked_mse_loss,
     masked_spearman_correlation,
-    configure_seed,
+    plot,
 )
 
 # -----------------------------
-# 0) Repro + device
+# 0) Seed + device
 # -----------------------------
 configure_seed(42)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(device)
 
 # -----------------------------
-# 1) Data
+# 1) Switch: grid search OR one run
 # -----------------------------
-train_dataset = load_rnacompete_data(protein_name="RBFOX1", split="train")
-val_dataset   = load_rnacompete_data(protein_name="RBFOX1", split="val")
-test_dataset  = load_rnacompete_data(protein_name="RBFOX1", split="test")
+RUN_GRID_SEARCH = True  # Set to False to run single config
 
-def make_loaders(batch_size):
+SINGLE_CONFIG = dict(
+    lr=1e-3,
+    dropout=0.2,
+    kernel_size=5,
+    channels=(64, 128, 256),
+
+)
+
+# Early stopping settings (see L05)
+PATIENCE = 8  # epochs to wait before stopping if no improvement
+MIN_DELTA = 1e-4  # require at least this improvement to reset patience
+
+# -----------------------------
+# 2) Data
+# -----------------------------
+protein_name = "RBFOX1"
+train_dataset = load_rnacompete_data(protein_name=protein_name, split="train")
+val_dataset   = load_rnacompete_data(protein_name=protein_name, split="val")
+test_dataset  = load_rnacompete_data(protein_name=protein_name, split="test")
+
+def make_dataloaders(batch_size=64):
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
     test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader, test_loader
+    return dict(train=train_loader, val=val_loader), test_loader
 
 # -----------------------------
-# 2) CNN Model A
+# 3) CNN model
 # -----------------------------
 class CNNRBP(nn.Module):
-    def __init__(
-        self,
-        channels=(32, 64, 128),
-        kernel_size=5,
-        dropout=0.2,
-    ):
+    def __init__(self, channels=(32, 64, 128), kernel_size=5, dropout=0.2):
         super().__init__()
-        c1, c2, c3 = channels
+        c1, c2, c3 = channels # channels for conv layers
+        pad = kernel_size // 2 # padding to maintain length before pooling
 
-        pad = kernel_size // 2
-        self.conv1 = nn.Conv1d(4, c1, kernel_size=kernel_size, padding=pad)
-        self.conv2 = nn.Conv1d(c1, c2, kernel_size=kernel_size, padding=pad)
-        self.conv3 = nn.Conv1d(c2, c3, kernel_size=kernel_size, padding=pad)
+        self.conv1 = nn.Conv1d(4,  c1, kernel_size=kernel_size, padding=pad) # input has 4 channels (A,C,G,U)
+        self.conv2 = nn.Conv1d(c1, c2, kernel_size=kernel_size, padding=pad) # second conv layer
+        self.conv3 = nn.Conv1d(c2, c3, kernel_size=kernel_size, padding=pad) # third conv layer
 
-        self.relu = nn.ReLU()
-        self.pool = nn.MaxPool1d(kernel_size=2)
-        self.drop = nn.Dropout(dropout)
+        self.relu = nn.ReLU() # non-linear activation
+        self.pool = nn.MaxPool1d(kernel_size=2) # downsample by factor of 2 using max pooling
+        self.drop = nn.Dropout(dropout) # dropout for regularization
 
-        # Robust pooling: avoids “conv_out_len guessing”
-        # Output becomes [B, c3, 1]
-        self.global_pool = nn.AdaptiveMaxPool1d(1)
+        self.global_pool = nn.AdaptiveMaxPool1d(1) # global max pooling to get fixed-size output
 
-        self.fc1 = nn.Linear(c3, 256)
-        self.fc2 = nn.Linear(256, 1)
+        self.fc1 = nn.Linear(c3, 256) # fully connected layer
+        self.fc2 = nn.Linear(256, 1) # output layer for regression
 
     def forward(self, x):
-        # x: [B, 41, 4] -> [B, 4, 41]
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1)  # [B,41,4] -> [B,4,41]
 
-        x = self.pool(self.relu(self.conv1(x)))
+        x = self.relu(self.conv1(x)) 
+        x = self.pool(x) 
+        x = self.drop(x) 
+
+        x = self.relu(self.conv2(x))
+        x = self.pool(x)
         x = self.drop(x)
 
-        x = self.pool(self.relu(self.conv2(x)))
+        x = self.relu(self.conv3(x))
+        x = self.pool(x)
         x = self.drop(x)
 
-        x = self.pool(self.relu(self.conv3(x)))
-        x = self.drop(x)
+        x = self.global_pool(x).squeeze(-1) # [B,C,1] -> [B,C]
+        x = self.drop(self.relu(self.fc1(x))) # FC + ReLU + Dropout
+        return self.fc2(x)
 
-        x = self.global_pool(x).squeeze(-1)  # [B, c3]
-        x = self.drop(self.relu(self.fc1(x)))
-        out = self.fc2(x)                    # [B, 1]
-        return out
+
 
 # -----------------------------
-# 3) Train/eval epoch
+# 4) Train/val with early stopping on val Spearman
 # -----------------------------
-@torch.no_grad()
-def evaluate(model, loader):
+def train_val_model_rna(
+    model,
+    optimizer,
+    dataloaders,
+    num_epochs=50,
+    scheduler=None,
+    log_interval=1,
+    patience=8,
+    min_delta=0.0,
+):
+    """
+    Tried to maintain similar structure to practical 07 with added early stopping
+      - train/val phases
+      - store curves
+      - keep best model weights on validation metric
+      - early stopping on validation Spearman with a patience window
+    """
+    since = time.time()
+
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_val_spear = -1e9
+    best_epoch = -1
+    bad_epochs = 0
+
+    losses = dict(train=[], val=[])
+    spears = dict(train=[], val=[])
+
+    for epoch in range(num_epochs):
+        if log_interval is not None and epoch % log_interval == 0:
+            print(f"Epoch {epoch}/{num_epochs - 1}")
+            print("-" * 10)
+
+        for phase in ["train", "val"]:
+            model.train() if phase == "train" else model.eval()
+
+            running_loss = 0.0
+            running_spear = 0.0
+            nsamples = 0
+
+            for x, y, mask in dataloaders[phase]:
+                x = x.to(device).float()
+                y = y.to(device).float()
+                mask = mask.to(device).float()
+                nsamples += x.size(0)
+
+                optimizer.zero_grad() # reset gradients
+
+                with torch.set_grad_enabled(phase == "train"): # only track gradients in train
+                    preds = model(x)
+                    loss = masked_mse_loss(preds, y, mask)
+
+                    if phase == "train": # backprop + optimize
+                        loss.backward()
+                        optimizer.step()
+
+                with torch.no_grad(): # compute Spearman without tracking gradients
+                    spear = masked_spearman_correlation(preds, y, mask)
+
+                running_loss += loss.item() * x.size(0)
+                running_spear += spear.item() * x.size(0)
+
+            if scheduler is not None and phase == "train": # step learning-rate scheduler only in train
+                scheduler.step()
+
+            epoch_loss = running_loss / nsamples
+            epoch_spear = running_spear / nsamples
+
+            losses[phase].append(epoch_loss)
+            spears[phase].append(epoch_spear)
+
+            if log_interval is not None and epoch % log_interval == 0:
+                print(f"{phase} Loss: {epoch_loss:.4f} Spearman: {epoch_spear:.3f}")
+
+            # Only update early stopping based on validation
+            if phase == "val":
+                if epoch_spear > best_val_spear + min_delta:
+                    best_val_spear = epoch_spear
+                    best_epoch = epoch
+                    best_model_wts = copy.deepcopy(model.state_dict())
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
+
+        if log_interval is not None and epoch % log_interval == 0:
+            print(f"Bad epochs: {bad_epochs}/{patience}\n")
+
+        # Early stopping trigger (after completing the val phase)
+        if bad_epochs >= patience:
+            print(f"Early stopping triggered at epoch {epoch} (best epoch {best_epoch}).")
+            break
+
+    time_elapsed = time.time() - since
+    print(f"Training complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s")
+    print(f"Best val Spearman: {best_val_spear:.3f} (epoch {best_epoch})")
+
+    model.load_state_dict(best_model_wts)
+    return model, losses, spears, best_val_spear, best_epoch
+
+
+@torch.no_grad() # No gradients needed for evaluation
+def evaluate_test(model, test_loader):
     model.eval()
     total_loss = 0.0
     total_spear = 0.0
-    n_batches = 0
+    nsamples = 0
 
-    for x, y, mask in loader:
+    for x, y, mask in test_loader:
         x = x.to(device).float()
         y = y.to(device).float()
         mask = mask.to(device).float()
+        nsamples += x.size(0)
 
         preds = model(x)
         loss = masked_mse_loss(preds, y, mask)
         spear = masked_spearman_correlation(preds, y, mask)
 
-        total_loss += loss.item()
-        total_spear += spear.item()
-        n_batches += 1
+        total_loss += loss.item() * x.size(0)
+        total_spear += spear.item() * x.size(0)
 
-    return total_loss / n_batches, total_spear / n_batches
+    return total_loss / nsamples, total_spear / nsamples
 
-def train_one_epoch(model, loader, optimizer):
-    model.train()
-    total_loss = 0.0
-    total_spear = 0.0
-    n_batches = 0
-
-    for x, y, mask in loader:
-        x = x.to(device).float()
-        y = y.to(device).float()
-        mask = mask.to(device).float()
-
-        optimizer.zero_grad()
-        preds = model(x)
-        loss = masked_mse_loss(preds, y, mask)
-        loss.backward()
-        optimizer.step()
-
-        with torch.no_grad():
-            spear = masked_spearman_correlation(preds, y, mask)
-
-        total_loss += loss.item()
-        total_spear += spear.item()
-        n_batches += 1
-
-    return total_loss / n_batches, total_spear / n_batches
 
 # -----------------------------
-# 4) Single run (with early stopping + logging)
+# 5) One run wrapper
 # -----------------------------
-def run_experiment(
-    exp_name,
-    batch_size=64,
-    lr=1e-3,
-    weight_decay=0.0,
-    channels=(32, 64, 128),
-    kernel_size=5,
-    dropout=0.2,
-    max_epochs=50,
-    patience=8,
-    out_dir="runs_cnn",
-):
+def run_one_config(cfg, out_dir="runs_cnn", batch_size=64, num_epochs=50, patience=8, min_delta=0.0):
     os.makedirs(out_dir, exist_ok=True)
 
-    train_loader, val_loader, test_loader = make_loaders(batch_size)
+    exp_name = cfg.get(
+        "exp_name",
+        f"cnn_lr{cfg['lr']}_do{cfg['dropout']}_k{cfg['kernel_size']}_ch{cfg['channels'][0]}"
+    )
 
-    model = CNNRBP(channels=channels, kernel_size=kernel_size, dropout=dropout).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    dataloaders, test_loader = make_dataloaders(batch_size=batch_size)
 
-    history = []
-    best_val_spear = -1e9
-    best_epoch = -1
-    best_state = None
-    bad_epochs = 0
+    model = CNNRBP(
+        channels=cfg["channels"],
+        kernel_size=cfg["kernel_size"],
+        dropout=cfg["dropout"],
+    ).to(device)
 
-    for epoch in range(1, max_epochs + 1):
-        tr_loss, tr_spear = train_one_epoch(model, train_loader, optimizer)
-        va_loss, va_spear = evaluate(model, val_loader)
+    optimizer = optim.Adam(model.parameters(), lr=cfg["lr"])
 
-        history.append({
-            "epoch": epoch,
-            "train_loss": tr_loss,
-            "val_loss": va_loss,
-            "train_spearman": tr_spear,
-            "val_spearman": va_spear,
-        })
+    model, losses, spears, best_val_spear, best_epoch = train_val_model_rna(
+        model=model,
+        optimizer=optimizer,
+        dataloaders=dataloaders,
+        num_epochs=num_epochs,
+        log_interval=1,
+        patience=patience,
+        min_delta=min_delta,
+    )
 
-        print(
-            f"[{exp_name}] Epoch {epoch:02d} | "
-            f"Train loss {tr_loss:.4f}, Val loss {va_loss:.4f} | "
-            f"Train ρ {tr_spear:.3f}, Val ρ {va_spear:.3f}"
-        )
+    # Test only once, after model selection on validation
+    test_loss, test_spear = evaluate_test(model, test_loader)
+    print(f"[{exp_name}] Test loss: {test_loss:.4f} | Test Spearman: {test_spear:.3f}")
 
-        # Early stopping on validation Spearman (main metric)
-        if va_spear > best_val_spear:
-            best_val_spear = va_spear
-            best_epoch = epoch
-            best_state = copy.deepcopy(model.state_dict())
-            bad_epochs = 0
-        else:
-            bad_epochs += 1
-            if bad_epochs >= patience:
-                print(f"[{exp_name}] Early stopping at epoch {epoch} (best epoch {best_epoch})")
-                break
+    # Curves length might be shorter due to early stopping
+    epochs = list(range(len(losses["train"])))
 
-    # Load best checkpoint and test once
-    model.load_state_dict(best_state)
-    te_loss, te_spear = evaluate(model, test_loader)
-    print(f"[{exp_name}] BEST epoch {best_epoch} | Test loss {te_loss:.4f}, Test Spearman {te_spear:.3f}")
-
-    # Save CSV history
     csv_path = os.path.join(out_dir, f"{exp_name}_history.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
-        writer.writeheader()
-        writer.writerows(history)
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "train_loss", "val_loss", "train_spearman", "val_spearman"])
+        for e in epochs:
+            writer.writerow([e, losses["train"][e], losses["val"][e], spears["train"][e], spears["val"][e]])
 
-    # Plot losses
-    epochs = [h["epoch"] for h in history]
-    train_losses = [h["train_loss"] for h in history]
-    val_losses = [h["val_loss"] for h in history]
+    # Plotting helper from utils.py
+    plot(
+        epochs,
+        {"train": losses["train"], "val": losses["val"]},
+        filename=os.path.join(out_dir, f"{exp_name}_loss.png"),
+    )
+    plot(
+        epochs,
+        {"train": spears["train"], "val": spears["val"]},
+        filename=os.path.join(out_dir, f"{exp_name}_spearman.png"),
+        ylim=(-0.1, 1.0),
+    )
 
-    plt.figure()
-    plt.plot(epochs, train_losses, label="train")
-    plt.plot(epochs, val_losses, label="val")
-    plt.xlabel("epoch")
-    plt.ylabel("masked MSE")
-    plt.title(f"{exp_name}: loss curves")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f"{exp_name}_loss.png"), dpi=150)
-    plt.close()
-
-    # Plot Spearman
-    train_s = [h["train_spearman"] for h in history]
-    val_s = [h["val_spearman"] for h in history]
-
-    plt.figure()
-    plt.plot(epochs, train_s, label="train")
-    plt.plot(epochs, val_s, label="val")
-    plt.xlabel("epoch")
-    plt.ylabel("Spearman")
-    plt.title(f"{exp_name}: Spearman curves")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f"{exp_name}_spearman.png"), dpi=150)
-    plt.close()
-
-    # Save best summary
-    summary = {
-        "exp_name": exp_name,
-        "batch_size": batch_size,
-        "lr": lr,
-        "weight_decay": weight_decay,
-        "channels": str(channels),
-        "kernel_size": kernel_size,
-        "dropout": dropout,
-        "best_epoch": best_epoch,
-        "best_val_spearman": float(best_val_spear),
-        "test_loss": float(te_loss),
-        "test_spearman": float(te_spear),
-    }
-
+    summary = dict(
+        exp_name=exp_name,
+        batch_size=batch_size,
+        lr=cfg["lr"],
+        dropout=cfg["dropout"],
+        kernel_size=cfg["kernel_size"],
+        channels=str(cfg["channels"]),
+        best_epoch=int(best_epoch),
+        best_val_spearman=float(best_val_spear),
+        test_loss=float(test_loss),
+        test_spearman=float(test_spear),
+        patience=int(patience),
+        min_delta=float(min_delta),
+    )
     return summary
 
+
 # -----------------------------
-# 5) CNN hyperparameter tuning (simple grid)
+# 6) Main
 # -----------------------------
 def main():
     out_dir = "runs_cnn"
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True) # create output dir if needed
 
-    # A simple, defensible tuning strategy:
-    # - small grid (few runs), pick best on val Spearman, evaluate test once.
-    # This respects “don’t tune on test”.[file:1][file:2]
+    # Single run
+    if not RUN_GRID_SEARCH:
+        cfg = dict(SINGLE_CONFIG)
+        cfg["exp_name"] = "cnn_single_run"
+        summary = run_one_config(
+            cfg,
+            out_dir=out_dir,
+            batch_size=64,
+            num_epochs=50,
+            patience=PATIENCE,
+            min_delta=MIN_DELTA,
+        )
+
+        print("\nSINGLE RUN SUMMARY")
+        for k, v in summary.items():
+            print(f"  {k}: {v}")
+        return
+
     grid = [
         {"lr": 1e-3, "dropout": 0.2, "kernel_size": 5, "channels": (32, 64, 128)},
         {"lr": 5e-4, "dropout": 0.2, "kernel_size": 5, "channels": (32, 64, 128)},
@@ -273,29 +332,24 @@ def main():
 
     all_summaries = []
     for i, cfg in enumerate(grid, start=1):
-        exp_name = f"cnn_run{i}_lr{cfg['lr']}_do{cfg['dropout']}_k{cfg['kernel_size']}_ch{cfg['channels'][0]}"
-        summary = run_experiment(
-            exp_name=exp_name,
-            batch_size=64,
-            lr=cfg["lr"],
-            weight_decay=0.0,
-            channels=cfg["channels"],
-            kernel_size=cfg["kernel_size"],
-            dropout=cfg["dropout"],
-            max_epochs=50,
-            patience=8,
+        cfg = dict(cfg)
+        cfg["exp_name"] = f"cnn_run{i}"
+        summary = run_one_config(
+            cfg,
             out_dir=out_dir,
+            batch_size=64,
+            num_epochs=50,
+            patience=PATIENCE,
+            min_delta=MIN_DELTA,
         )
         all_summaries.append(summary)
 
-    # Save tuning summary CSV
     summary_path = os.path.join(out_dir, "cnn_tuning_summary.csv")
     with open(summary_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(all_summaries[0].keys()))
         writer.writeheader()
         writer.writerows(all_summaries)
 
-    # Print best by validation Spearman
     best = max(all_summaries, key=lambda d: d["best_val_spearman"])
     print("\nBEST CNN CONFIG (by val Spearman):")
     for k, v in best.items():
